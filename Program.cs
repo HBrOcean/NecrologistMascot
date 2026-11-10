@@ -28,12 +28,25 @@ internal static class Program
             return;
         }
 
+        // 窗口预演：按真实窗口参数离屏渲染几帧，画布尺寸 = 窗口尺寸
+        //   NecrologistMascot.exe --preview [皮肤id|-] [缩放] [motion|absolute|dynamic]
+        if (args.Length > 0 && args[0] == "--preview")
+        {
+            string? skin = args.Length > 1 && args[1] != "-" ? args[1] : null;
+            double sc = args.Length > 2 && double.TryParse(args[2], out double pv) ? pv : 0.15;
+            string mode = args.Length > 3 ? args[3] : "absolute";
+            Diagnostics.Preview(skin, sc, mode);
+            return;
+        }
+
         // 几何自检：纯数值验证「角色是否会画到窗口外」
-        //   NecrologistMascot.exe --fit [缩放] [皮肤id]
+        //   NecrologistMascot.exe --fit [缩放] [皮肤id] [motion|absolute|dynamic]
         if (args.Length > 0 && args[0] == "--fit")
         {
             double sc = args.Length > 1 && double.TryParse(args[1], out double v) ? v : 0.15;
-            Diagnostics.Fit(sc, args.Length > 2 ? args[2] : null);
+            string? skin = args.Length > 2 && args[2] != "-" ? args[2] : null;
+            string mode = args.Length > 3 ? args[3] : "absolute";
+            Diagnostics.Fit(sc, skin, mode);
             return;
         }
 

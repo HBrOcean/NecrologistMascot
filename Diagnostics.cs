@@ -67,6 +67,10 @@ public static class Diagnostics
         var b = model.Bounds;
         Console.WriteLine($"[Dump] Bounds: {b.MinX:F1},{b.MinY:F1} .. {b.MaxX:F1},{b.MaxY:F1}"
                         + $"  锚点 ({model.AnchorX:F1},{model.AnchorY:F1})");
+        var mb = model.MotionBounds; var ab = model.AbsBounds;
+        Console.WriteLine($"[Dump] 分位框 {b.MaxX - b.MinX:F0}×{b.MaxY - b.MinY:F0}"
+                        + $"  动作范围框 {mb.MaxX - mb.MinX:F0}×{mb.MaxY - mb.MinY:F0}"
+                        + $"  绝对框 {ab.MaxX - ab.MinX:F0}×{ab.MaxY - ab.MinY:F0}");
 
         // 用待机动画推进几帧再统计：setup pose 里大量 slot 的 attachment 还是 null
         model.SetAnimation(0, model.HasAnimation("idle") ? "idle" : "", true);
@@ -135,20 +139,127 @@ public static class Diagnostics
     }
 
     /// <summary>
+    /// 窗口预演：完全按 PetRenderControl 的窗口参数（取框模式 / Pad / GroundInset）
+    /// 离屏渲染几帧，画布尺寸就等于真实窗口尺寸，用来直观看「角色在窗口里占多大、会不会出界」。
+    /// </summary>
+    public static void Preview(string? onlySkinId, double scale, string mode)
+    {
+        SkinEntry? skin = null;
+        foreach (var e in SkinCatalog.All)
+        {
+            if (!e.IsUsable) continue;
+            if (!string.IsNullOrWhiteSpace(onlySkinId)
+                && !string.Equals(e.Id, onlySkinId, StringComparison.OrdinalIgnoreCase)) continue;
+            skin = e; break;
+        }
+        if (skin == null) { Console.WriteLine("[Preview] 没有可用皮肤"); return; }
+
+        string m = FrameModes.Normalize(mode);
+        using var model = new SkeletonModel(
+            Path.Combine(skin.Dir!, skin.Id + ".atlas"),
+            Path.Combine(skin.Dir!, skin.Id + ".skel"));
+
+        var box = m switch
+        {
+            FrameModes.Absolute => model.AbsBounds,
+            FrameModes.Dynamic => model.Bounds,
+            _ => model.MotionBounds,
+        };
+        bool dyn = m == FrameModes.Dynamic;
+        double padX = dyn ? PetRenderControl.PadX : PetRenderControl.FixedPad;
+        double padY = dyn ? PetRenderControl.PadY : PetRenderControl.FixedPad;
+
+        float ax = model.AnchorX, ay = model.AnchorY;
+        float left = Math.Max(1e-3f, ax - box.MinX);
+        float right = Math.Max(1e-3f, box.MaxX - ax);
+        float halfW = Math.Max(left, right);
+        float halfH = box.MaxY - ay;
+        double gi = Math.Max(PetRenderControl.GroundInset, (ay - box.MinY) * scale + 4);
+        double ratio = dyn ? 0.5 : left / (left + right);   // 与 AnchorRatioOnWindow 一致
+
+        int wDip = (int)Math.Round((dyn ? halfW * 2.0 : left + right) * scale * (1 + padX));
+        int hDip = (int)Math.Round(halfH * scale * (1 + padY) + gi);
+        int W = Math.Max(1, wDip), H = Math.Max(1, hDip);
+
+        Console.WriteLine($"[Preview] {skin.Id}（{skin.DisplayName}）取框 {FrameModes.Label(m)}"
+                        + $" → 窗口 {W}×{H} DIP（缩放 {scale:P0}）");
+        Console.WriteLine($"[Preview] 框 半宽 {halfW:F0} / 向上 {halfH:F0}，脚底距下沿 {gi:F1} DIP");
+
+        string outDir = Path.Combine(Path.GetTempPath(), "NecrologistMascot-dump");
+        Directory.CreateDirectory(outDir);
+
+        var shots = new List<(string Anim, float T, string Tag)>();
+        foreach (var cand in new[] { "idle", "skill1", "skill3", "unique", "die" })
+        {
+            if (!model.HasAnimation(cand)) continue;
+            shots.Add((cand, cand == "idle" ? 0.6f : 1.0f, cand));
+        }
+
+        // 2 倍超采样：图更清晰，也方便肉眼判断边界
+        const int SS = 2;
+        foreach (var (anim, t, tag) in shots)
+        {
+            model.SetAnimation(0, anim, false);
+            model.Update(t);
+
+            var info = new SKImageInfo(W * SS, H * SS, SKColorType.Rgba8888, SKAlphaType.Premul);
+            using var surface = SKSurface.Create(info);
+            var canvas = surface.Canvas;
+            canvas.Clear(SKColors.White);
+
+            // 浅色棋盘格，方便看透出多少空白
+            using var checker = new SKPaint { Color = new SKColor(232, 236, 242) };
+            const int cell = 8 * SS;
+            for (int y = 0; y < H * SS; y += cell)
+                for (int x = 0; x < W * SS; x += cell)
+                    if (((x / cell) + (y / cell)) % 2 == 0)
+                        canvas.DrawRect(x, y, cell, cell, checker);
+
+            // 与 RenderFrame 同一套变换
+            float s = (float)(scale * SS);
+            float groundPx = H * SS - (float)(gi * SS);
+            canvas.Save();
+            canvas.Translate((float)(W * SS * ratio), groundPx);
+            canvas.Scale(s, -s);
+            canvas.Translate(-ax, -ay);
+            using (var renderer = new SpineCanvasRenderer())
+                renderer.Draw(canvas, model.Skeleton, model);
+            canvas.Restore();
+
+            // 窗口边界
+            using var border = new SKPaint
+            {
+                Color = new SKColor(220, 90, 60),
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 1,
+            };
+            canvas.DrawRect(0.5f, 0.5f, W * SS - 1, H * SS - 1, border);
+            canvas.Flush();
+
+            string path = Path.Combine(outDir, $"preview-{skin.Id}-{tag}.png");
+            using var img = surface.Snapshot();
+            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
+            File.WriteAllBytes(path, data.ToArray());
+            Console.WriteLine("[Preview] 已保存 " + path);
+        }
+    }
+
+    /// <summary>
     /// 几何自检：不启动窗口，纯数值模拟「窗口随动作自适应」的视框，
     /// 逐动画逐帧算出角色是否会画到窗口外。
     ///
     /// 越界判定用比例表示：1.00 = 刚好贴边，&gt; 1 表示超出。
     /// 视框规则与 PetRenderControl.UpdateView 完全一致（扩张立即生效、上限 1.5 倍）。
     /// </summary>
-    public static void Fit(double scale = 0.15, string? onlySkinId = null)
+    public static void Fit(double scale = 0.15, string? onlySkinId = null, string mode = FrameModes.Absolute)
     {
         const double PadX = PetRenderControl.PadX;
         const double PadY = PetRenderControl.PadY;
         const double GroundInset = PetRenderControl.GroundInset;
         const float MaxExpand = PetRenderControl.MaxExpand;
 
-        Console.WriteLine($"[Fit] 缩放 {scale:P0}，PadX {PadX:P0}，PadY {PadY:P0}，GroundInset {GroundInset} DIP");
+        Console.WriteLine($"[Fit] 缩放 {scale:P0}，PadX {PadX:P0}，PadY {PadY:P0}，GroundInset {GroundInset} DIP"
+                        + $"，取框 {FrameModes.Label(mode)}");
 
         foreach (var skin in SkinCatalog.All)
         {
@@ -160,7 +271,13 @@ public static class Diagnostics
                 Path.Combine(skin.Dir!, skin.Id + ".atlas"),
                 Path.Combine(skin.Dir!, skin.Id + ".skel"));
 
-            var b = model.Bounds;
+            var b = FrameModes.Normalize(mode) switch
+            {
+                FrameModes.Absolute => model.AbsBounds,
+                FrameModes.Dynamic => model.Bounds,
+                _ => model.MotionBounds,
+            };
+            bool dyn = FrameModes.Normalize(mode) == FrameModes.Dynamic;
             float ax = model.AnchorX, ay = model.AnchorY;
             float statHalfW = Math.Max(1e-3f, Math.Max(ax - b.MinX, b.MaxX - ax));
             float statHalfH = Math.Max(1e-3f, b.MaxY - ay);   // 只算向上（锚点在下沿）
@@ -207,8 +324,8 @@ public static class Diagnostics
                     // 与 UpdateView 同一套规则（含两层天花板：绝对框 + MaxExpand 安全阀）
                     float capW = Math.Min(statHalfW * MaxExpand, Math.Max(statHalfW, absHalfW));
                     float capH = Math.Min(statHalfH * MaxExpand, Math.Max(statHalfH, absHalfH));
-                    float viewW = Math.Min(Math.Max(statHalfW, needW), capW);
-                    float viewH = Math.Min(Math.Max(statHalfH, needUp), capH);
+                    float viewW = dyn ? Math.Min(Math.Max(statHalfW, needW), capW) : statHalfW;
+                    float viewH = dyn ? Math.Min(Math.Max(statHalfH, needUp), capH) : statHalfH;
 
                     float availW = viewW * (float)(1 + PadX);
                     float availUp = viewH * (float)(1 + PadY);

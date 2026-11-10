@@ -76,6 +76,15 @@ public sealed class AppConfig
     /// </summary>
     public bool DynamicSize { get; set; } = true;
 
+    /// <summary>
+    /// 窗口取框模式：
+    ///   motion   —— 动作范围框（默认）：踢掉骨架整体位移的帧后取并集，窗口固定且覆盖所有原地动作
+    ///   absolute —— 纯绝对框：连「角色飞出画面」的帧也算进去，窗口最宽
+    ///   dynamic  —— 分位框 + 随动作伸缩（旧行为）
+    /// 取值见 Rendering/FrameModes.cs。
+    /// </summary>
+    public string WindowFrame { get; set; } = "absolute";
+
     // —— 按键映射 ——
     public List<KeyBinding> KeyBindings { get; set; } = new();
 

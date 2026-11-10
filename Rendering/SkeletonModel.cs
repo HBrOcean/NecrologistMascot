@@ -39,6 +39,16 @@ public sealed class SkeletonModel : IDisposable
     public (float MinX, float MinY, float MaxX, float MaxY) AbsBounds { get; private set; }
 
     /// <summary>
+    /// 「动作范围」包围盒：先按帧中心偏移剔除「骨架整体位移」的帧，再取并集，并与分位框取并。
+    ///
+    /// 为什么需要它：讣告人的 skill3 / unique 会把整个骨架平移到 x≈-214（idle 的中心是 +5），
+    /// 这类帧不是「手伸得远」，而是角色整体飞出画面。把它们算进静态框，
+    /// 窗口会白留将近一倍的宽度（绝对框 711、动作范围只有 355），角色被挤成窗口里的一小只。
+    /// 剔掉之后剩下的并集仍然覆盖所有「原地做动作」的帧，所以不会裁到任何正常动作。
+    /// </summary>
+    public (float MinX, float MinY, float MaxX, float MaxY) MotionBounds { get; private set; }
+
+    /// <summary>
     /// 角色锚点的 X：身体中轴（Spine 本地坐标）。
     /// 取自「头部带」顶点的 x 中位数 —— 中位数天然忽略伸出去的武器/披风。
     /// </summary>
@@ -185,6 +195,7 @@ public sealed class SkeletonModel : IDisposable
         if (frames.Count == 0)
         {
             AbsBounds = (-100, -100, 100, 100);
+            MotionBounds = AbsBounds;
             return (-100, -100, 100, 100);
         }
         // 绝对框
@@ -202,6 +213,9 @@ public sealed class SkeletonModel : IDisposable
 
         // 绝对框永远记下来：视框扩张的天花板用它，保证任何一帧都不会画到窗外
         AbsBounds = (x0, y0, x1, y1);
+
+        // 动作范围框：剔掉「骨架整体飞出画面」的帧后的并集
+        MotionBounds = ComputeMotionBounds(frames, q);
 
         // 只有绝对框被少数极端帧撑大到 2.2 倍以上，才改用它。
         // 阈值定得比较高：宁可包围盒偏大（角色略小），也不要因为误判而裁掉动作。
@@ -350,6 +364,55 @@ public sealed class SkeletonModel : IDisposable
                      + $"（宽 +{(maxFW / finalW - 1) * 100:0}%，高 +{(maxFH / finalH - 1) * 100:0}%）"
                      + "，这些帧会被裁掉");
         }
+    }
+
+    /// <summary>
+    /// 「动作范围框」：只保留「原地做动作」的帧，剔除骨架整体位移的帧。
+    ///
+    /// 判据是「帧包围盒中心」相对分位框中心的偏移，阈值取分位框最长边的 30%。
+    /// 用中心而不是尺寸：手伸得再远，中心也只在原地小幅移动；而整体位移的帧，
+    /// 中心会平移半个身位以上（实测 skill3 的位移帧中心在 x≈-214，idle 在 +5）。
+    ///
+    /// 最后与分位框取并集 —— 分位框本身是「90% 帧都落在里面」的保守估计，
+    /// 和它取并可以保证结果永远不会比它更小。
+    /// </summary>
+    private static (float X0, float Y0, float X1, float Y1) ComputeMotionBounds(
+        List<(float X0, float Y0, float X1, float Y1)> frames,
+        (float X0, float Y0, float X1, float Y1) q)
+    {
+        float qcx = (q.X0 + q.X1) / 2f;
+        float qcy = (q.Y0 + q.Y1) / 2f;
+        float thr = 0.30f * Math.Max(1e-3f, Math.Max(q.X1 - q.X0, q.Y1 - q.Y0));
+
+        float x0 = float.MaxValue, y0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue;
+        int kept = 0, dropped = 0;
+
+        foreach (var f in frames)
+        {
+            float cx = (f.X0 + f.X1) / 2f;
+            float cy = (f.Y0 + f.Y1) / 2f;
+
+            if (Math.Abs(cx - qcx) > thr || Math.Abs(cy - qcy) > thr) { dropped++; continue; }
+
+            kept++;
+            if (f.X0 < x0) x0 = f.X0;
+            if (f.Y0 < y0) y0 = f.Y0;
+            if (f.X1 > x1) x1 = f.X1;
+            if (f.Y1 > y1) y1 = f.Y1;
+        }
+
+        if (kept == 0) return q;
+
+        // 与分位框取并，保证不比它窄
+        x0 = Math.Min(x0, q.X0);
+        y0 = Math.Min(y0, q.Y0);
+        x1 = Math.Max(x1, q.X1);
+        y1 = Math.Max(y1, q.Y1);
+
+        Logger.Log($"[Bounds] 动作范围框 {x1 - x0:0}×{y1 - y0:0}"
+                 + $"（保留 {kept} 帧，剔除 {dropped} 个整体位移帧，阈值 ±{thr:0}）");
+
+        return (x0, y0, x1, y1);
     }
 
     /// <summary>取四边各的 10% / 90% 分位，排除大幅位移的异常帧。</summary>

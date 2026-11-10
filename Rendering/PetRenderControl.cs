@@ -6,6 +6,7 @@ using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using Avalonia.Threading;
+using NecrologistMascot.Services;
 using SkiaSharp;
 using Spine;
 
@@ -22,6 +23,14 @@ public sealed class PetRenderControl : Control, IDisposable
     private readonly SpineCanvasRenderer _renderer = new();
     private readonly DispatcherTimer _timer;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
+
+    /// <summary>
+    /// 帧级追踪开关（环境变量 NECRO_TRACE=1 打开）。
+    /// 每 10 帧记一条：窗口像素尺寸、锚点比例、脚底线位置、控件尺寸。
+    /// 定位"角色抖动"时看这行有没有周期性变化即可 —— 全都不变就说明抖动不在渲染层。
+    /// </summary>
+    private static readonly bool Trace = Environment.GetEnvironmentVariable("NECRO_TRACE") == "1";
+    private int _traceTick;
 
     private WriteableBitmap? _wbmp;
     private SKSurface? _surface;
@@ -51,6 +60,15 @@ public sealed class PetRenderControl : Control, IDisposable
     public const double PadY = 0.12;
 
     /// <summary>
+    /// 固定框模式（motion / absolute）下的边距。
+    ///
+    /// 那两个框本身就是「逐帧顶点的并集」，已经覆盖到最远的一个像素，
+    /// 再按动态模式的 25%/12% 留白纯属浪费 —— 只留 3% 给抗锯齿就够了。
+    /// 动态模式必须保留大边距：它的框是分位框，要留提前量给「动作比框大」的那几帧。
+    /// </summary>
+    public const double FixedPad = 0.03;
+
+    /// <summary>
     /// 角色「脚底线」到窗口下沿的固定距离（DIP）。
     /// 必须是常数，不能写成窗口高度的比例 —— 窗口会随动作长高，
     /// 用比例的话脚会跟着往下滑。用常数时，只要窗口底边不动，脚就绝对不动。
@@ -68,9 +86,9 @@ public sealed class PetRenderControl : Control, IDisposable
     {
         get
         {
-            // 用静态框（分位框）而不是绝对框：绝对框包含个别极端帧（脚下大特效、
-            // 倒地），拿它算会让脚底离窗口下沿留出一大截空白，看起来像悬空。
-            double below = (_model.AnchorY - _model.Bounds.MinY) * Scale;
+            // 跟着当前取框模式走：窗口用的是哪个框，脚下留白就按哪个框算，
+            // 否则换成「绝对框」模式后，框下沿比角色实际低很多，脚会看起来悬空。
+            double below = (_model.AnchorY - StaticBox.MinY) * Scale;
             return Math.Max(GroundInset, below + 4);
         }
     }
@@ -79,14 +97,53 @@ public sealed class PetRenderControl : Control, IDisposable
     /// 运行时视框相对静态框的最大扩张倍率。
     ///
     /// 静态框经过分位数保护（砍掉最极端的 10% 帧），所以个别动作会比它大不少：
-    /// 实测讣告人 303701 的 skill3 横向需要 2.06 倍、303702 的 innate1 向上需要 1.27 倍。
-    /// 实测讣告人 303701 的 skill3 需要 3.86 倍、303702 的 skill2 需要 3.65 倍，
-    /// 所以要放到 4.0 才能把这些「手/道具甩出很远」的动作完整放进窗口。
+    /// 实测 303701 的 skill3 横向需要 3.86 倍静态半框（≈ 留边后可用宽度的 206%），
+    /// 303702 的 skill2 需要 3.65 倍 —— 所以取 4.0 才装得下这些「手/道具甩出去」的动作。
     /// 它同时是安全阀：born 这种「从画面外飞入」的动画需要的倍率远大于 4，
     /// 被它截断后就自然被裁在画面外 —— 那本来就是期望效果。
     /// PetRenderControl 与 Diagnostics.Fit 共用这一个常量，改一处即可。
     /// </summary>
     public const float MaxExpand = 4.0f;
+
+    /// <summary>
+    /// 窗口取框模式：
+    ///   motion   —— 「动作范围框」（默认）。剔除骨架整体位移的帧后取并集。
+    ///               窗口一次定死、覆盖所有原地动作，不随动作伸缩，也不裁动作。
+    ///   absolute —— 纯绝对框（所有帧的顶点并集）。一定会覆盖每一帧，
+    ///               但把「角色飞出画面」的位移帧也算进去，窗口会白宽将近一倍。
+    ///   dynamic  —— 分位框 + 随动作扩张（旧行为）。窗口最小，但会不停伸缩。
+    /// </summary>
+    public string FrameMode { get; set; } = FrameModes.Absolute;
+
+    /// <summary>当前模式下用作「静态框」的包围盒。</summary>
+    private (float MinX, float MinY, float MaxX, float MaxY) StaticBox => FrameMode switch
+    {
+        FrameModes.Absolute => _model.AbsBounds,
+        FrameModes.Dynamic => _model.Bounds,
+        _ => _model.MotionBounds,
+    };
+
+    /// <summary>只有 dynamic 模式才需要每帧算视框扩张；另外两种模式尺寸恒定。</summary>
+    public bool IsDynamicMode => string.Equals(FrameMode, FrameModes.Dynamic, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>锚点左侧需要多少（Spine 单位）。</summary>
+    private float BoxLeft => Math.Max(1e-3f, _model.AnchorX - StaticBox.MinX);
+
+    /// <summary>锚点右侧需要多少（Spine 单位）。</summary>
+    private float BoxRight => Math.Max(1e-3f, StaticBox.MaxX - _model.AnchorX);
+
+    /// <summary>
+    /// 锚点在窗口里的水平位置（0 = 最左，1 = 最右）。
+    ///
+    /// 动态模式固定 0.5：它要靠「对称扩张」保证角色始终在窗口正中，否则每次 resize
+    /// 角色都会左右跑一下。
+    ///
+    /// 固定框模式改成按框的不对称度落位：讣告人的绝对框左边要 506、右边只要 118
+    /// （大招把角色甩到画面左侧），硬钉中间会让窗口宽度 = 506×2，右边 388 单位纯属浪费 ——
+    /// 角色只占窗口宽度的 12%。按比例落位后窗口宽度变成 506+118=624，角色占 37%，
+    /// 而且仍然一帧都不裁。锚点是静态的，不会随帧移动，所以不会有"跑来跑去"的问题。
+    /// </summary>
+    public double AnchorRatioOnWindow => IsDynamicMode ? 0.5 : BoxLeft / (BoxLeft + BoxRight);
 
     /// <summary>桌宠缩放（DIP）。</summary>
     public double Scale { get; set; } = 1.0;
@@ -141,7 +198,12 @@ public sealed class PetRenderControl : Control, IDisposable
         get
         {
             // 宽度：锚点在水平中心，左右各留 _halfW，所以是 2 倍。
-            double w = _halfW * 2.0 * Scale;
+            double padX = IsDynamicMode ? PadX : FixedPad;
+            double padY = IsDynamicMode ? PadY : FixedPad;
+
+            // 动态模式左右对称（角色居中）；固定模式按「左需求 + 右需求」算，不留对称冗余
+            double widthUnits = IsDynamicMode ? _halfW * 2.0 : (BoxLeft + BoxRight);
+            double w = widthUnits * Scale;
 
             // 高度：锚点（脚底）钉在窗口下沿上方 GroundInset 处，角色只往上长，
             // 所以只需要 1 倍 _halfH，不能再乘 2。
@@ -151,8 +213,8 @@ public sealed class PetRenderControl : Control, IDisposable
             // 透明空白，既点不到也拖不动，视觉上像"蹲在窗口下半截"。
             double h = _halfH * Scale;
 
-            return new Size(Math.Max(1, w * (1 + PadX)),
-                            Math.Max(1, h * (1 + PadY) + GroundInsetDips));
+            return new Size(Math.Max(1, w * (1 + padX)),
+                            Math.Max(1, h * (1 + padY) + GroundInsetDips));
         }
     }
 
@@ -182,8 +244,10 @@ public sealed class PetRenderControl : Control, IDisposable
         var canvas = surface.Canvas;
         canvas.Clear(SKColors.Transparent);
 
-        // 视框跟随动作幅度（窗口尺寸由 PetWindow 根据 DesiredPetSize 同步调整）
-        UpdateView();
+        // 只有「随动作伸缩」模式才需要每帧重算视框。
+        // 固定框模式下 _halfW/_halfH 是常量：再每帧跑一遍收敛逻辑，
+        // 等于让 DesiredPetSize 也跟着每帧重算一次浮点 —— 没有任何收益，只留抖动风险。
+        if (IsDynamicMode) UpdateView();
 
         // 锚点 = 「身体中轴 + 脚底」，不再用包围盒中心。
         //
@@ -200,9 +264,10 @@ public sealed class PetRenderControl : Control, IDisposable
             ? (float)Math.Sin(_clock.Elapsed.TotalSeconds * 1.8) * 5f * (float)_cachedScaling
             : 0f;
 
-        // 脚底线钉在窗口下沿上方 GroundInsetDips 处；水平钉在窗口正中
+        // 脚底线钉在窗口下沿上方 GroundInsetDips 处；
+        // 水平位置由 AnchorRatioOnWindow 决定（动态模式=正中，固定框模式=按框的不对称度）
         float groundPx = ph - (float)(GroundInsetDips * _cachedScaling) + bobPx;
-        canvas.Translate(pw * 0.5f, groundPx);
+        canvas.Translate(pw * (float)AnchorRatioOnWindow, groundPx);
 
         // 绘制比例只由「用户缩放 × 屏幕 DPI」决定，与窗口尺寸彻底解耦。
         //
@@ -229,6 +294,11 @@ public sealed class PetRenderControl : Control, IDisposable
                                         PixelFormat.Rgba8888, AlphaFormat.Premul);
         }
 
+        if (Trace && (++_traceTick % 10) == 0)
+            Logger.Log($"[Trace] pw={pw} ph={ph} ratio={AnchorRatioOnWindow:F4}"
+                     + $" ground={groundPx:F2} bounds={Bounds.Width:F2}x{Bounds.Height:F2}"
+                     + $" scale={Scale:F3} dpi={_cachedScaling:F2}");
+
         unsafe
         {
             using var fb = _wbmp.Lock();
@@ -253,7 +323,7 @@ public sealed class PetRenderControl : Control, IDisposable
     /// </summary>
     private void UpdateView()
     {
-        var sb = _model.Bounds;
+        var sb = StaticBox;
         float ax = _model.AnchorX;
         float ay = _model.AnchorY;
 
@@ -266,7 +336,7 @@ public sealed class PetRenderControl : Control, IDisposable
         float targetW = statHalfW;
         float targetH = statHalfH;
 
-        if (DynamicView && TryGetFrameBounds(out var fb))
+        if (IsDynamicMode && DynamicView && TryGetFrameBounds(out var fb))
         {
             // 当前帧相对中心需要多大的半宽/半高。
             // 取两侧的较大值 —— 对称扩张才不会让角色偏离窗口中心。
@@ -292,17 +362,21 @@ public sealed class PetRenderControl : Control, IDisposable
         if (targetW < statHalfW) targetW = statHalfW;
         if (targetH < statHalfH) targetH = statHalfH;
 
-        // 扩张立即生效；收缩前留 1 秒宽限 ——
-        // 动作之间常常只隔零点几秒，立刻收缩会导致窗口反复缩涨，看着像抽搐。
+        // 扩张立即生效；收缩延迟 1 秒，然后「一次到位」。
+        //
+        // 之前收缩是按 12%/帧插值的，等于在收缩的那 0.6 秒里让 DesiredPetSize
+        // 每帧都变小一点点，OnSizeTick 每 3 DIP 就跟一次 resize —— 每次 resize 都要
+        // UpdateLayout + 改 Position，窗口就一格一格地抖。
+        // 直接赋值只会产生 1 次 resize，代价是窗口"啪"地收回去，但那一瞬间角色
+        // 本来也已经在回待机，肉眼几乎看不出。
         float now = (float)_clock.Elapsed.TotalSeconds;
         const float ShrinkDelay = 1.0f;
-        const float ShrinkK = 0.12f;   // 开始收之后约 0.6 秒到位
 
         if (targetW > _halfW) { _halfW = targetW; _lastGrowTime = now; }
-        else if (now - _lastGrowTime > ShrinkDelay) _halfW += (targetW - _halfW) * ShrinkK;
+        else if (targetW < _halfW && now - _lastGrowTime > ShrinkDelay) _halfW = targetW;
 
         if (targetH > _halfH) { _halfH = targetH; _lastGrowTime = now; }
-        else if (now - _lastGrowTime > ShrinkDelay) _halfH += (targetH - _halfH) * ShrinkK;
+        else if (targetH < _halfH && now - _lastGrowTime > ShrinkDelay) _halfH = targetH;
     }
 
     /// <summary>锚点到绝对包围盒左/右边界中较远的那个距离。</summary>
@@ -318,7 +392,7 @@ public sealed class PetRenderControl : Control, IDisposable
     /// <summary>把视框立刻复位到静态包围盒（关闭动态尺寸时用）。</summary>
     public void ResetView()
     {
-        var b = _model.Bounds;
+        var b = StaticBox;
         _halfW = Math.Max(1e-3f, Math.Max(_model.AnchorX - b.MinX, b.MaxX - _model.AnchorX));
         _halfH = Math.Max(1e-3f, b.MaxY - _model.AnchorY);
     }
@@ -375,4 +449,31 @@ public sealed class PetRenderControl : Control, IDisposable
         _surface?.Dispose();
         _wbmp?.Dispose();
     }
+}
+
+/// <summary>窗口取框模式的取值（配置里存的就是这几个字符串）。</summary>
+public static class FrameModes
+{
+    /// <summary>动作范围框：固定尺寸，覆盖所有原地动作（默认）。</summary>
+    public const string Motion = "motion";
+
+    /// <summary>纯绝对框：把「角色飞出画面」的位移帧也算进去，窗口更宽。</summary>
+    public const string Absolute = "absolute";
+
+    /// <summary>分位框 + 随动作伸缩（旧行为）。</summary>
+    public const string Dynamic = "dynamic";
+
+    public static string Normalize(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch
+    {
+        Motion => Motion,
+        Dynamic => Dynamic,
+        _ => Absolute,     // 没配置 / 配置写错 → 用「绝不裁」的绝对框
+    };
+
+    public static string Label(string mode) => Normalize(mode) switch
+    {
+        Motion => "动作范围（固定，略小）",
+        Dynamic => "随动作伸缩（最小，会变尺寸）",
+        _ => "绝对框（最大，绝不裁）",
+    };
 }

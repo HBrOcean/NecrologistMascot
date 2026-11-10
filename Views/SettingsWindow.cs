@@ -14,6 +14,7 @@ using Avalonia.Media.Imaging;
 using Avalonia.Media.Transformation;   // TransformOperations
 using Avalonia.Styling;                // Style / Setter / Selector
 using NecrologistMascot.Config;
+using NecrologistMascot.Rendering;
 using NecrologistMascot.Services;
 
 // Avalonia.Input 里也有一个 KeyBinding（XAML 手势绑定用），
@@ -470,6 +471,45 @@ public class SettingsWindow : Window
         scaleGrid.Children.Add(scalePercent);
 
         panel.Children.Add(Group("缩放", scaleGrid));
+
+        // 窗口取框模式：决定窗口多大、要不要随动作伸缩
+        var frameBox = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        frameBox.ItemsSource = new List<string>
+        {
+            FrameModes.Label(FrameModes.Motion),
+            FrameModes.Label(FrameModes.Absolute),
+            FrameModes.Label(FrameModes.Dynamic),
+        };
+        frameBox.SelectedIndex = FrameModes.Normalize(_config.WindowFrame) switch
+        {
+            FrameModes.Motion => 0,
+            FrameModes.Dynamic => 2,
+            _ => 1,
+        };
+        frameBox.SelectionChanged += (_, __) =>
+        {
+            string m = frameBox.SelectedIndex switch
+            {
+                1 => FrameModes.Absolute,
+                2 => FrameModes.Dynamic,
+                _ => FrameModes.Motion,
+            };
+            _pet.SetWindowFrame(m);
+        };
+
+        var framePanel = new StackPanel { Spacing = 8 };
+        framePanel.Children.Add(Row("取框模式", frameBox));
+        framePanel.Children.Add(new TextBlock
+        {
+            Text = "动作范围：一次性把窗口定到装下所有「原地动作」，之后尺寸不变（推荐）。\n"
+                 + "绝对框：连「角色飞出画面」的帧也算进去，窗口更宽、角色相对更小，但绝不裁。\n"
+                 + "随动作伸缩：窗口最小，播动作时临时变大、结束后缩回。",
+            FontSize = 12,
+            Opacity = 0.75,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = new SolidColorBrush(Color.Parse("#6B5540")),
+        });
+        panel.Children.Add(Group("窗口尺寸", framePanel));
 
         var toggles = new StackPanel { Spacing = 8 };
         toggles.Children.Add(MakeCheck("在任务栏显示图标", _config.ShowInTaskbar,

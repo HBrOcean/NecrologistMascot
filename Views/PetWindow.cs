@@ -66,7 +66,16 @@ public class PetWindow : Window
             Bobbing = config.Bobbing,
             Flip = config.Flip,
             DynamicView = config.DynamicSize,
+            FrameMode = FrameModes.Normalize(config.WindowFrame),
         };
+
+        // ⚠ 必须在初始化器之后重置一次视框。
+        // PetRenderControl 的构造函数里已经调过一次 ResetView()，但那时 FrameMode
+        // 还是字段默认值（绝对框）—— 对象初始化器是在构造函数之后才赋值的。
+        // 于是视框会先按「绝对框」的 506 算好，之后再被 UpdateView 以 12%/帧的速度
+        // 收敛到运动/动态模式的 205 或 131；这 1 秒里 DesiredPetSize 每帧都在变，
+        // OnSizeTick 每 2 DIP 就 resize 一次 —— 表现就是启动瞬间角色剧烈抖动。
+        _pet.ResetView();
 
         // 窗口图标（角色大头照）
         Icon = AppIcons.Load("app.png");
@@ -169,10 +178,18 @@ public class PetWindow : Window
     private void LogSize(string tag)
     {
         var b = _model.Bounds;
+        var mb = _model.MotionBounds;
+        var ab = _model.AbsBounds;
         var s = _pet.DesiredPetSize;
-        Logger.Log($"[Size] {tag} 包围盒 {b.MaxX - b.MinX:0}×{b.MaxY - b.MinY:0}"
-                 + $"（x {b.MinX:0}..{b.MaxX:0}, y {b.MinY:0}..{b.MaxY:0}）"
-                 + $" 锚点 ({_model.AnchorX:0},{_model.AnchorY:0})"
+
+        // 三种框都打出来：取框模式一换，窗口尺寸的来源就变了，
+        // 只打一个 Bounds 会让排查的人对着数字算不出窗口为什么这么大。
+        Logger.Log($"[Size] {tag} 取框 {FrameModes.Label(_pet.FrameMode)}"
+                 + $" | 分位 {b.MaxX - b.MinX:0}×{b.MaxY - b.MinY:0}"
+                 + $" 动作范围 {mb.MaxX - mb.MinX:0}×{mb.MaxY - mb.MinY:0}"
+                 + $" 绝对 {ab.MaxX - ab.MinX:0}×{ab.MaxY - ab.MinY:0}"
+                 + $" | 锚点 ({_model.AnchorX:0},{_model.AnchorY:0})"
+                 + $" 锚点水平位置 {_pet.AnchorRatioOnWindow:P0}"
                  + $" → 窗口 {s.Width:0}×{s.Height:0}（缩放 {_config.Scale:P0}）");
     }
 
@@ -243,7 +260,13 @@ public class PetWindow : Window
     {
         _sizeTimer.Tick -= OnSizeTick;
 
-        if (_config.DynamicSize)
+        // 只有「随动作伸缩」模式才需要 33ms 轮询尺寸。
+        // 固定框模式（绝对框 / 动作范围）的期望尺寸是常量，
+        // 开着这个计时器等于每 33ms 比较一次浮点并可能触发 resize ——
+        // resize 会连带 UpdateLayout + 改 Position，是「窗口/角色抖动」的经典来源。
+        bool needPolling = _config.DynamicSize && _pet.IsDynamicMode;
+
+        if (needPolling)
         {
             _pet.DynamicView = true;
             _sizeTimer.Interval = TimeSpan.FromMilliseconds(33);
@@ -252,8 +275,8 @@ public class PetWindow : Window
         }
         else
         {
-            _pet.DynamicView = false;
-            _pet.ResetView();          // 视框立刻回到静态包围盒
+            _pet.DynamicView = _config.DynamicSize;
+            _pet.ResetView();          // 视框立刻回到静态框
             _sizeTimer.Stop();
             ResizeKeepingAnchor(_pet.DesiredPetSize.Width, _pet.DesiredPetSize.Height);
         }
@@ -267,6 +290,23 @@ public class PetWindow : Window
         Logger.Log($"[Size] 窗口随动作自适应：{(on ? "开启" : "关闭")}");
     }
 
+    /// <summary>
+    /// 切换窗口取框模式（设置面板实时调用）。
+    ///
+    /// 换框会立刻改变期望尺寸，所以顺手重排一次窗口 —— 仍然锚定底边中点，脚不动。
+    /// </summary>
+    public void SetWindowFrame(string mode)
+    {
+        string m = FrameModes.Normalize(mode);
+        _config.WindowFrame = m;
+        _pet.FrameMode = m;
+
+        _pet.ResetView();            // 视框立刻切到新框，别等下一帧
+        ApplySizeKeepingBottom();
+        ApplyDynamicSize();          // 换模式后 33ms 轮询该开就开、该停就停
+        LogSize("窗口取框=" + FrameModes.Label(m));
+    }
+
     private void OnSizeTick(object? sender, EventArgs e)
     {
         if (_pressed) return;      // 拖动过程中改尺寸会和人抢，手感会抖
@@ -274,8 +314,9 @@ public class PetWindow : Window
 
         var s = _pet.DesiredPetSize;
 
-        // 小于 2 DIP 的变化不动窗口，避免一直在 resize
-        if (Math.Abs(s.Width - Width) < 2 && Math.Abs(s.Height - Height) < 2) return;
+        // 死区从 2 DIP 提到 3 DIP：动态模式的视框是逐帧插值收缩的，
+        // 死区太小会让窗口以「2px 一步」的频率跟，看起来就是一格一格地抖。
+        if (Math.Abs(s.Width - Width) < 3 && Math.Abs(s.Height - Height) < 3) return;
 
         ResizeKeepingAnchor(s.Width, s.Height);
     }
@@ -308,7 +349,8 @@ public class PetWindow : Window
         // 锚点取「底边中点」而不是窗口中心：
         // 渲染时角色的脚钉在窗口下沿固定距离处，只要底边在屏幕上不动，
         // 窗口因为动作长高长宽时，脚就绝对不动（中心锚点会让脚上下滑一半高度）。
-        int anchorX = Position.X + oldPxW / 2;
+        double ratio = _pet.AnchorRatioOnWindow;
+        int anchorX = Position.X + (int)Math.Round(oldPxW * ratio);
         int anchorY = Position.Y + oldPxH;
 
         Width = w;
@@ -324,7 +366,7 @@ public class PetWindow : Window
         // 换肤、动作膨胀连续 resize 时，这种滞后帧会连成一片，看着就是「一直往左上飘」。
         UpdateLayout();
 
-        Position = new PixelPoint(anchorX - newPxW / 2, anchorY - newPxH);
+        Position = new PixelPoint(anchorX - (int)Math.Round(newPxW * ratio), anchorY - newPxH);
 
         // 这里刻意**不**做屏幕钳制：
         // 视框收缩是渐进的，每 33ms clamp 一次等于把窗口位置一格一格往回推，
@@ -491,7 +533,9 @@ public class PetWindow : Window
             Bobbing = _config.Bobbing,
             Flip = _config.Flip,
             DynamicView = _config.DynamicSize,
+            FrameMode = FrameModes.Normalize(_config.WindowFrame),
         };
+        _pet.ResetView();   // 同上：换皮肤重建控件后，视框要按当前取框模式立刻定好
         _pet.PointerPressed += OnPointerPressed;
         _pet.PointerMoved += OnPointerMoved;
         _pet.PointerReleased += OnPointerReleased;
